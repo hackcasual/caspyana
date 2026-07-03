@@ -182,11 +182,28 @@ async function rebuildAndSolve() {
   // Table units are per SECOND (desktop yafc compatible); UI shows /min.
   for (const goal of goals) await rpc('tableAddLink', goal.tdn, goal.perMin / 60);
   for (const tdn of linked) await rpc('tableAddLink', tdn, 0);
-  for (const row of rows) await rpc('tableAddRecipe', row.tdn);
+  for (const row of rows) await rpc('tableAddRecipe', row.tdn, (row.fixed ?? 0) / 60);
   renderSolve(await rpc('tableSolve'));
 }
 
 const cost = (c) => c > 0 ? `<span class="muted mono">\u00a4${c >= 100 ? c.toFixed(0) : c.toFixed(1)}</span>` : '';
+
+const WARN_ALARM = (1 << 16) | (1 << 17) | (1 << 18);  // solver warnings -> orange plate
+function warningText(bits) {
+  const parts = [];
+  if (bits & (1 << 16)) parts.push('Deadlock: this loop needs an external source to start');
+  if (bits & (1 << 17)) parts.push('Overproduction required: a linked byproduct cannot be fully consumed');
+  if (bits & (1 << 18)) parts.push('Needs more buildings than built');
+  if (bits & (1 << 2)) parts.push('Fuel consumption limited: craft time stretched to match fuel input cap');
+  if (bits & (1 << 6)) parts.push('Productivity capped at this recipe\'s maximum');
+  if (bits & (1 << 8)) parts.push('No crafter selected — using raw recipe time');
+  if (bits & (1 << 9)) parts.push('No fuel selected — energy shown as raw power draw');
+  if (bits & (1 << 10)) parts.push('Fuel temperature exceeds the maximum this building can use');
+  if (bits & (1 << 11)) parts.push('Selected fuel provides no energy to this building');
+  if (bits & (1 << 12)) parts.push('Temperature-based fuel is not linked, energy unknown');
+  if (bits & (1 << 0)) parts.push('Assumes Nauvis day/night solar ratio');
+  return parts.join(' · ') || 'solver warning';
+}
 
 function fmt(x) {
   const abs = Math.abs(x);
@@ -204,7 +221,8 @@ async function renderSolve(result) {
 
   // Goals: amber pills, click amount to edit, x to remove.
   $('#goals').innerHTML = goals.map((g, i) =>
-      `<span class="pill goal">${esc(g.name)}
+      `<span class="pill goal${g.perMin < 0 ? ' input' : ''}">` +
+      `<button class="chip" data-goods="${g.tdn}">${esc(g.name)}</button>
          <button class="small ghost amt" data-goal="${i}" title="Edit demand">${g.perMin}/min</button>
          <button class="x" data-goal-x="${i}" aria-label="Remove goal">✕</button></span>`)
       .join('') ||
@@ -212,8 +230,10 @@ async function renderSolve(result) {
   for (const btn of $('#goals').querySelectorAll('[data-goal]')) {
     btn.onclick = () => {
       const goal = goals[+btn.dataset.goal];
-      const perMin = parseFloat(prompt(`Demand for ${goal.name} (per minute):`, goal.perMin));
-      if (Number.isFinite(perMin) && perMin > 0) { goal.perMin = perMin; rebuildAndSolve(); }
+      const perMin = parseFloat(prompt(
+          `Demand for ${goal.name} in units/min\n(negative = input goal: consume this much)`,
+          goal.perMin));
+      if (Number.isFinite(perMin) && perMin !== 0) { goal.perMin = perMin; rebuildAndSolve(); }
     };
   }
   for (const btn of $('#goals').querySelectorAll('[data-goal-x]')) {
@@ -222,14 +242,22 @@ async function renderSolve(result) {
 
   // Recipe nameplates.
   const plates = await Promise.all(result.rows.map(async (row, i) => {
-    const flows = row.flows.map((f) =>
-        `<span class="flow ${f.perMin >= 0 ? 'pos' : 'neg'}">` +
-        `${fmt(f.perMin * 60)} ${esc(short(f.tdn))}</span>`).join('');
-    return `<div class="plate${row.warnings ? ' warn' : ''}">
+    const flows = (await Promise.all(row.flows.map(async (f) =>
+        `<button class="flow chip ${f.perMin >= 0 ? 'pos' : 'neg'}" data-goods="${f.tdn}"` +
+        ` title="${esc(f.tdn)}">${await iconImg(f.tdn)}` +
+        `${fmt(f.perMin * 60)}</button>`))).join('');
+    const entity = row.entity && row.entity.tdn ? `<span class="entity" title="${esc(row.entity.locName)}">` +
+        `${await iconImg(row.entity.tdn)}<span class="amt">×${fmt(row.buildings)}</span>` +
+        `${row.entity.powerMw > 0 ? `<span class="muted amt">${fmt(row.entity.powerMw * row.buildings * 1000)}kW</span>` : ''}` +
+        `</span>` : '';
+    return `<div class="plate${row.warnings & WARN_ALARM ? ' warn' : ''}">
       <div class="head">${await iconImg(row.recipe.tdn)}
         <span class="name" title="${esc(row.recipe.tdn)}">${esc(row.recipe.locName)}</span>
-        ${row.warnings ? '<span title="solver warning">⚠</span>' : ''}
-        <span class="crafts">${fmt(row.craftsPerMin * 60)}<small>crafts/min</small></span>
+        ${entity}
+        ${row.warnings ? `<span title="${esc(warningText(row.warnings))}">⚠</span>` : ''}
+        <button class="crafts${rows[i]?.fixed ? ' pinned' : ''}" data-pin="${i}"
+          title="${rows[i]?.fixed ? 'Rate pinned — click to change/unpin' : 'Click to pin this rate'}">
+          ${rows[i]?.fixed ? '📌 ' : ''}${fmt(row.craftsPerMin * 60)}<small>crafts/min</small></button>
         <button class="x" data-row-x="${i}" aria-label="Remove row">✕</button>
       </div>
       <div class="flows">${flows}</div>
@@ -239,6 +267,18 @@ async function renderSolve(result) {
   for (const btn of $('#rows').querySelectorAll('[data-row-x]')) {
     btn.onclick = () => { rows.splice(+btn.dataset.rowX, 1); rebuildAndSolve(); };
   }
+  for (const btn of $('#rows').querySelectorAll('[data-pin]')) {
+    btn.onclick = () => {
+      const row = rows[+btn.dataset.pin];
+      const current = row.fixed ? String(row.fixed) : '';
+      const answer = prompt('Pin rate in crafts/min (empty to unpin):', current);
+      if (answer === null) return;
+      const value = parseFloat(answer);
+      if (answer.trim() === '' || !Number.isFinite(value) || value <= 0) delete row.fixed;
+      else row.fixed = value;
+      rebuildAndSolve();
+    };
+  }
 
   // Links: neutral pills; unmatched marked red; x unlinks (goals excluded).
   const linkPills = result.links.map((l) => {
@@ -247,7 +287,8 @@ async function renderSolve(result) {
     const unlink = isGoal ? '' :
         `<button class="x" data-unlink="${l.tdn}" aria-label="Unlink">✕</button>`;
     return `<span class="pill${bad ? ' bad' : ''}" title="${bad ? 'unmatched — needs both a producer and a consumer in-table' : 'matched'}">
-        ${esc(l.name)} <span class="amt">${fmt(l.flow * 60)}/min</span>${unlink}</span>`;
+        <button class="chip" data-goods="${l.tdn}">${esc(l.name)}</button>
+        <span class="amt">${fmt(l.flow * 60)}/min</span>${unlink}</span>`;
   });
   $('#links').innerHTML = linkPills.join('') || '<span class="muted">—</span>';
   for (const btn of $('#links').querySelectorAll('[data-unlink]')) {
@@ -265,7 +306,7 @@ async function renderSolve(result) {
       .map(async (f) =>
       `<div class="row">${await iconImg(f.tdn)}` +
       `<span class="amt ${f.perMin > 0 ? 'pos' : 'neg'}">${fmt(f.perMin * 60)}/min</span>` +
-      `<span>${esc(f.name)}</span>` +
+      `<button class="chip" data-goods="${f.tdn}">${esc(f.name)}</button>` +
       `<button class="small" data-pull="${f.tdn}" data-side="${f.perMin < 0 ? 'p' : 'c'}">` +
       `${f.perMin < 0 ? 'produce ▸' : 'consume ▸'}</button>` +
       `<button class="small ghost" data-link="${f.tdn}">link only</button></div>`));
@@ -280,6 +321,18 @@ async function renderSolve(result) {
 
 // ---- candidate auto-pull ----
 const inTable = (tdn) => goals.some((g) => g.tdn === tdn) || linked.includes(tdn);
+
+// Desktop yafc's core gesture: click any goods, anywhere, to explore it.
+document.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-goods]');
+  if (!el) return;
+  setTab(true);
+  if (window.innerWidth <= 760) {
+    $('#left').classList.add('open');
+    $('#catalogFab').textContent = '✕';
+  }
+  showGoods(el.dataset.goods);
+});
 
 async function pullCandidates(tdn, wantProducers) {
   if (!inTable(tdn)) linked.push(tdn);
@@ -316,6 +369,17 @@ async function renderRecipeList(title, list, header = '') {
 }
 
 // ---- search / goods info ----
+document.addEventListener('keydown', (e) => {
+  if (e.key === '/' && document.activeElement?.tagName !== 'INPUT') {
+    e.preventDefault();
+    setTab(true);
+    $('#search').focus();
+  }
+});
+$('#search').onkeydown = (e) => {
+  if (e.key === 'Enter') $('#results [data-tdn]')?.click();
+  if (e.key === 'Escape') { e.target.value = ''; $('#results').innerHTML = ''; }
+};
 $('#search').oninput = async (e) => {
   const query = e.target.value.trim();
   if (query.length < 2) { $('#results').innerHTML = ''; return; }
@@ -338,8 +402,10 @@ async function showGoods(tdn) {
       `<div class="eyebrow">${esc(info.goods.locName)}</div>
        <button id="goalBtn">Set demand…</button>`);
   $('#goalBtn').onclick = () => {
-    const perMin = parseFloat(prompt(`Demand for ${info.goods.locName} (per minute):`, '900'));
-    if (Number.isFinite(perMin) && perMin > 0) {
+    const perMin = parseFloat(prompt(
+        `Demand for ${info.goods.locName} in units/min\n(negative = input goal: consume this much)`,
+        '900'));
+    if (Number.isFinite(perMin) && perMin !== 0) {
       goals.push({ tdn, name: info.goods.locName, perMin });
       rebuildAndSolve();
     }
@@ -399,7 +465,9 @@ $('#shareBtn').onclick = async () => {
   persist();
   const text = await rpc('projectSaveRaw', JSON.stringify(pages));
   const encoded = await deflateBase64Url(text);
-  const url = `${location.origin}${location.pathname}?p=${encoded}`;
+  // Fragment, not query: never sent to the server, so no URL-length limits
+  // (or log leakage) apply; the link doubles as a bookmark of the table.
+  const url = `${location.origin}${location.pathname}#p=${encoded}`;
   try {
     await navigator.clipboard.writeText(url);
     status(`share link copied (${url.length} chars)`);
@@ -439,8 +507,14 @@ $('#projectFile').onchange = (e) => {
   reader.readAsText(file);
 };
 
+function sharedPayloadFromUrl() {
+  if (location.hash.startsWith('#p=')) return location.hash.slice(3);
+  // Legacy links used ?p= before the move to fragments.
+  return new URLSearchParams(location.search).get('p');
+}
+
 async function loadProjectFromUrl() {
-  const encoded = new URLSearchParams(location.search).get('p');
+  const encoded = sharedPayloadFromUrl();
   if (!encoded) return false;
   try {
     await importProjectText(await inflateBase64Url(encoded));
@@ -451,6 +525,12 @@ async function loadProjectFromUrl() {
     return false;
   }
 }
+
+// Fragment-only navigation does not reload the page: pasting a different
+// share link into an open tab must still load that project.
+window.addEventListener('hashchange', () => {
+  if (bundleKey && location.hash.startsWith('#p=')) loadProjectFromUrl();
+});
 
 // ---- language: browser auto-detection + selector ----
 function pickLanguage(available) {

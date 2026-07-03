@@ -1,0 +1,10 @@
+{
+ "packs": [
+  {
+   "id": "pyanodon",
+   "name": "Pyanodon",
+   "file": "bundles/pyanodon.yafcbundle",
+   "bytes": 41925570
+  }
+ ]
+}
